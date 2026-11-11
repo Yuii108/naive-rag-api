@@ -23,9 +23,14 @@ class AskRequest(BaseModel):
         description="返回的相关文本块数量"
     )
 
-    strategy: Literal["naive", "hyde"] = Field(
+    strategy: Literal[
+        "naive",
+        "hyde",
+        "multi_query",
+        "multi_step",
+    ] = Field(
         default="naive",
-        description="选择 Naive 或 HyDE 检索",
+        description="选择检索策略",
     )
 
     include_original: bool = Field(

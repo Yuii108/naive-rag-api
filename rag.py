@@ -9,6 +9,11 @@ from langchain_openai import ChatOpenAI
 from indexer import build_index
 from retriever import retrieve
 from hyde import hyde_embedding_texts
+from multi_query import (
+    generate_queries,
+    multi_query_retrieve,
+)
+from multi_step import multi_step_retrieve
 
 
 # 无法回答时统一返回的内容
@@ -103,42 +108,79 @@ class RAGService:
 
     # 4. 完整问答流程
     def ask(
-    self,
-    question: str,
-    top_k: int = 3,
-    strategy: str = "naive",
-    include_original: bool = True,
-) -> dict:
+            self,
+            question: str,
+            top_k: int = 3,
+            strategy: str = "naive",
+            include_original: bool = True,
+        ) -> dict:
 
         if not question.strip():
             raise ValueError("问题不能为空")
 
         
         # 检查检索策略
-        if strategy not in {"naive", "hyde"}:
+        if strategy not in {
+            "naive",
+            "hyde",
+            "multi_query",
+            "multi_step",
+        }:
             raise ValueError("不支持的检索策略")
 
-        # 默认使用原始问题
-        embedding_texts = None
 
-        # 如果选择 HyDE，就先生成假设文档
-        if strategy == "hyde":
-            embedding_texts = hyde_embedding_texts(
+
+        # 第一种策略：Multi-Step
+        if strategy == "multi_step":
+
+            results, _steps = multi_step_retrieve(
                 llm=self.llm,
                 question=question,
-                include_original=include_original,
+                chunks=self.chunks,
+                vectors=self.vectors,
+                model=self.embedding_model,
+                top_k=top_k,
+                max_steps=2,
+            )
+
+        # 第二种策略：Multi-Query
+        elif strategy == "multi_query":
+
+            queries = generate_queries(
+                llm=self.llm,
+                question=question,
+                num_queries=3,
+            )
+
+            results = multi_query_retrieve(
+                queries=queries,
+                chunks=self.chunks,
+                vectors=self.vectors,
+                model=self.embedding_model,
+                top_k=top_k,
+            )
+
+        # 第三、四种：Naive 和 HyDE
+        else:
+            embedding_texts = None
+
+            if strategy == "hyde":
+                embedding_texts = hyde_embedding_texts(
+                    llm=self.llm,
+                    question=question,
+                    include_original=include_original,
+                )
+
+            results = retrieve(
+                question=question,
+                chunks=self.chunks,
+                vectors=self.vectors,
+                model=self.embedding_model,
+                top_k=top_k,
+                embedding_texts=embedding_texts,
             )
 
 
-        # 第一步：检索相关文档
-        results = retrieve(
-            question=question,
-            chunks=self.chunks,
-            vectors=self.vectors,
-            model=self.embedding_model,
-            top_k=top_k,
-            embedding_texts=embedding_texts,
-        )
 
         if not results:
             return {
