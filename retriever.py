@@ -32,7 +32,8 @@ def retrieve(
     chunks: list[Document],
     vectors: np.ndarray,
     model: SentenceTransformer,
-    top_k: int = 3
+    top_k: int = 3,
+    embedding_texts: list[str] | None = None,
 ) -> list[dict]:
 
     # 检查输入
@@ -45,16 +46,38 @@ def retrieve(
     if len(chunks) != len(vectors):
         raise ValueError("文本块和向量数量不一致")
 
-    # 第一步：将问题转换成向量
-    query_text = QUERY_INSTRUCTION + question.strip()
 
-    query_vector = model.encode(
-        query_text,
-        normalize_embeddings=True,
-        convert_to_numpy=True
+    # 第一步：确定需要转换成向量的文本
+    if embedding_texts is None:
+        texts = [question]
+    else:
+        texts = embedding_texts
+
+    if not texts or any(not text.strip() for text in texts):
+        raise ValueError("检索文本不能为空")
+
+    # 第二步：分别生成 Embedding
+    query_vectors = []
+
+    for text in texts:
+        query_text = QUERY_INSTRUCTION + text.strip()
+
+        vector = model.encode(
+            query_text,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+
+        query_vectors.append(vector)
+
+    # 第三步：计算多个向量的平均值
+    query_vector = np.mean(
+        np.stack(query_vectors),
+        axis=0
     )
 
-    # 第二步：逐个计算相似度
+
+    # 第四步：逐个计算相似度
     results = []
 
     for i, chunk in enumerate(chunks):
@@ -69,13 +92,13 @@ def retrieve(
             "metadata": chunk.metadata.copy()
         })
 
-    # 第三步：按照相似度从高到低排序
+    # 第五步：按照相似度从高到低排序
     results.sort(
         key=lambda item: item["score"],
         reverse=True
     )
 
-    # 第四步：取前K个结果
+    # 第六步：取前K个结果
     return results[:top_k]
 
 

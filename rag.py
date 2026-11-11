@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 # 复用之前完成的模块
 from indexer import build_index
 from retriever import retrieve
+from hyde import hyde_embedding_texts
 
 
 # 无法回答时统一返回的内容
@@ -101,10 +102,33 @@ class RAGService:
         )
 
     # 4. 完整问答流程
-    def ask(self, question: str, top_k: int = 3) -> dict:
+    def ask(
+    self,
+    question: str,
+    top_k: int = 3,
+    strategy: str = "naive",
+    include_original: bool = True,
+) -> dict:
 
         if not question.strip():
             raise ValueError("问题不能为空")
+
+        
+        # 检查检索策略
+        if strategy not in {"naive", "hyde"}:
+            raise ValueError("不支持的检索策略")
+
+        # 默认使用原始问题
+        embedding_texts = None
+
+        # 如果选择 HyDE，就先生成假设文档
+        if strategy == "hyde":
+            embedding_texts = hyde_embedding_texts(
+                llm=self.llm,
+                question=question,
+                include_original=include_original,
+            )
+
 
         # 第一步：检索相关文档
         results = retrieve(
@@ -112,7 +136,8 @@ class RAGService:
             chunks=self.chunks,
             vectors=self.vectors,
             model=self.embedding_model,
-            top_k=top_k
+            top_k=top_k,
+            embedding_texts=embedding_texts,
         )
 
         if not results:

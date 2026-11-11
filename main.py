@@ -1,4 +1,4 @@
-
+from typing import Literal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -21,6 +21,16 @@ class AskRequest(BaseModel):
         ge=1,
         le=10,
         description="返回的相关文本块数量"
+    )
+
+    strategy: Literal["naive", "hyde"] = Field(
+        default="naive",
+        description="选择 Naive 或 HyDE 检索",
+    )
+
+    include_original: bool = Field(
+        default=True,
+        description="HyDE 是否包含原始问题",
     )
 
     @field_validator("question")
@@ -103,7 +113,9 @@ def ask(payload: AskRequest, request: Request):
         # 调用 Day 4 的完整 RAG 流程
         result = rag.ask(
             question=payload.question,
-            top_k=payload.top_k
+            top_k=payload.top_k,
+            strategy=payload.strategy,
+            include_original=payload.include_original,
         )
 
     except APIError as exc:
