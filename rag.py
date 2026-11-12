@@ -1,5 +1,6 @@
 
 import os
+from threading import Lock
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
@@ -14,10 +15,24 @@ from multi_query import (
     multi_query_retrieve,
 )
 from multi_step import multi_step_retrieve
+from bm25_retriever import (
+    build_bm25_retriever,
+    bm25_retrieve,
+)
+from hybrid_retriever import hybrid_retrieve
+from reranker import (
+    build_local_reranker,
+    rerank_results,
+)
+
 
 
 # 无法回答时统一返回的内容
 NO_ANSWER = "根据现有文档无法回答该问题。"
+
+class RerankerUnavailableError(RuntimeError):
+    """本地 Reranker 加载或推理失败。"""
+
 
 
 # 1. 定义 RAG Prompt
@@ -93,6 +108,20 @@ class RAGService:
             build_index()
         )
 
+
+        # 创建 BM25 检索器
+        self.bm25 = build_bm25_retriever(
+            chunks=self.chunks,
+            candidate_k=10,
+        )
+
+        # 本地 Reranker 暂时不加载
+        self._reranker = None
+
+        # 防止多个请求重复加载 Reranker
+        self._reranker_lock = Lock()
+
+
         # 创建 DeepSeek 客户端
         self.llm = ChatOpenAI(
             model="deepseek-flash",
@@ -106,6 +135,20 @@ class RAGService:
             max_retries=2,
         )
 
+    def _get_reranker(self):
+
+        if self._reranker is None:
+
+            with self._reranker_lock:
+
+                if self._reranker is None:
+                    self._reranker = build_local_reranker(
+                        top_n=10,
+                    )
+
+        return self._reranker
+
+
     # 4. 完整问答流程
     def ask(
             self,
@@ -117,21 +160,75 @@ class RAGService:
 
         if not question.strip():
             raise ValueError("问题不能为空")
+        
+        if not 1 <= top_k <= 10:
+            raise ValueError("top_k 必须在 1~10 之间")
 
         
-        # 检查检索策略
+
         if strategy not in {
             "naive",
             "hyde",
             "multi_query",
             "multi_step",
+            "bm25",
+            "hybrid",
+            "hybrid_rerank",
         }:
             raise ValueError("不支持的检索策略")
 
 
+        # 新策略 1：BM25
+        if strategy == "bm25":
+
+            results = bm25_retrieve(
+                question=question,
+                chunks=self.chunks,
+                bm25=self.bm25,
+                top_k=top_k,
+            )
+
+        # 新策略 2、3：Hybrid / Hybrid + Rerank
+        elif strategy in {"hybrid", "hybrid_rerank"}:
+
+            # 如果要精排，就先保留更多候选
+            fusion_top_k = (
+                max(8, top_k)
+                if strategy == "hybrid_rerank"
+                else top_k
+            )
+
+            # 第一步：BM25 + Embedding + RRF
+            results = hybrid_retrieve(
+                question=question,
+                chunks=self.chunks,
+                vectors=self.vectors,
+                model=self.embedding_model,
+                bm25=self.bm25,
+                top_k=fusion_top_k,
+                candidate_k=10,
+            )
+
+            # 第二步：可选本地精排
+            if strategy == "hybrid_rerank" and results:
+
+                try:
+                    results = rerank_results(
+                        question=question,
+                        candidates=results,
+                        reranker=self._get_reranker(),
+                    )[:top_k]
+
+                except (OSError, RuntimeError, ImportError) as exc:
+                    raise RerankerUnavailableError(
+                        "本地 Reranker 加载或推理失败"
+                    ) from exc
+
+
+
 
         # 第一种策略：Multi-Step
-        if strategy == "multi_step":
+        elif strategy == "multi_step":
 
             results, _steps = multi_step_retrieve(
                 llm=self.llm,

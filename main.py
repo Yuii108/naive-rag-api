@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator
 from openai import APIError
 
 # 导入 Day 4 实现的 RAG 服务
-from rag import RAGService
+from rag import RAGService, RerankerUnavailableError
 
 
 # 1. 请求数据模型
@@ -28,6 +28,9 @@ class AskRequest(BaseModel):
         "hyde",
         "multi_query",
         "multi_step",
+        "bm25",
+        "hybrid",
+        "hybrid_rerank",
     ] = Field(
         default="naive",
         description="选择检索策略",
@@ -90,10 +93,10 @@ async def lifespan(app: FastAPI):
 
 # 6. 创建 FastAPI 应用
 app = FastAPI(
-    title="Naive RAG 文档问答 API",
-    description="基于 BGE + DeepSeek Flash 的文档问答系统",
-    version="1.0.0",
-    lifespan=lifespan
+    title="Hybrid RAG 文档问答 API",
+    description="支持 BM25、Embedding、RRF 和本地 BGE Rerank",
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
 
@@ -122,6 +125,12 @@ def ask(payload: AskRequest, request: Request):
             strategy=payload.strategy,
             include_original=payload.include_original,
         )
+
+    except RerankerUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="本地精排模型不可用，请检查模型文件和运行环境",
+        ) from exc
 
     except APIError as exc:
         # DeepSeek API 调用失败
