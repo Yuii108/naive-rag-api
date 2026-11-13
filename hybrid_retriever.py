@@ -69,19 +69,30 @@ def hybrid_retrieve(
     bm25: BM25Retriever,
     top_k: int = 3,
     candidate_k: int = 5,
+    semantic_search=None,
 ) -> list[dict]:
 
     if top_k < 1 or candidate_k < top_k:
         raise ValueError("要求 1 <= top_k <= candidate_k")
 
-    # 第一步：Embedding 召回候选文档
-    embedding_results = retrieve(
-        question=question,
-        chunks=chunks,
-        vectors=vectors,
-        model=model,
-        top_k=candidate_k,
-    )
+
+    # 优先使用传进来的统一检索函数
+    if semantic_search is None:
+        # 旧版 NumPy 检索，保持兼容
+        embedding_results = retrieve(
+            question=question,
+            chunks=chunks,
+            vectors=vectors,
+            model=model,
+            top_k=candidate_k,
+        )
+    else:
+        # 新版：由 RAGService 决定 NumPy 或 Milvus
+        embedding_results = semantic_search(
+            question=question,
+            top_k=candidate_k,
+        )
+
 
     # 第二步：BM25 召回候选文档
     bm25_results = bm25_retrieve(

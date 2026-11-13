@@ -6,6 +6,14 @@ from sentence_transformers import SentenceTransformer
 # 复用 Day 2 的索引构建函数和检索指令
 from indexer import build_index, QUERY_INSTRUCTION
 
+import json
+
+from pymilvus import MilvusClient
+
+from milvus_store import (
+    COLLECTION_NAME,
+    VECTOR_DIM,
+)
 
 # 1. 手写余弦相似度
 def cosine_similarity(
@@ -100,6 +108,127 @@ def retrieve(
 
     # 第六步：取前K个结果
     return results[:top_k]
+
+
+# 3. 使用 Milvus 进行向量检索
+def milvus_retrieve(
+    question: str,
+    model: SentenceTransformer,
+    client: MilvusClient,
+    top_k: int = 3,
+    embedding_texts: list[str] | None = None,
+    source: str | None = None,
+) -> list[dict]:
+
+    """返回与原来 retrieve() 相同格式的检索结果。"""
+
+    # 第一步：检查输入
+    if not question.strip():
+        raise ValueError("问题不能为空")
+
+    if top_k < 1:
+        raise ValueError("top_k 必须大于等于 1")
+
+    # 第二步：确定需要 Embedding 的查询文本
+    if embedding_texts is None:
+        texts = [question]
+    else:
+        texts = embedding_texts
+
+    if not texts or any(not s.strip() for s in texts):
+        raise ValueError("检索文本不能为空")
+
+    # 第三步：生成查询向量
+    vectors = []
+
+    for text in texts:
+        query_text = QUERY_INSTRUCTION + text.strip()
+
+        vector = model.encode(
+            query_text,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+
+        vectors.append(vector)
+
+    # 与旧版 retrieve() 保持一致：
+    # 多个查询向量求平均
+    query_vector = np.mean(
+        np.stack(vectors),
+        axis=0,
+    )
+
+    if (
+        query_vector.ndim != 1
+        or query_vector.shape[0] != VECTOR_DIM
+    ):
+        raise ValueError(
+            f"查询向量维度不正确：{query_vector.shape}"
+        )
+
+    # 第四步：准备可选的 Metadata 过滤条件
+    filter_expr = ""
+
+    if source is not None:
+        filter_expr = (
+            "source == "
+            + json.dumps(source, ensure_ascii=False)
+        )
+
+    # 第五步：交给 Milvus 搜索
+    response = client.search(
+        collection_name=COLLECTION_NAME,
+        data=[query_vector.tolist()],
+        anns_field="vector",
+        search_params={
+            "metric_type": "COSINE",
+            "params": {},
+        },
+        filter=filter_expr,
+        limit=top_k,
+        output_fields=[
+            "text",
+            "source",
+            "file_type",
+            "page",
+            "start_index",
+            "chunk_id",
+        ],
+        consistency_level="Strong",
+    )
+
+    # 第六步：转换成原项目使用的结果格式
+    results = []
+
+    for hit in response[0]:
+
+        entity = hit["entity"]
+
+        # Day 3 把无页码存为 -1
+        # 这里恢复为原来的 None
+        raw_page = entity.get("page", -1)
+
+        if raw_page is None or int(raw_page) == -1:
+            page = None
+        else:
+            page = int(raw_page)
+
+        results.append({
+            "content": entity["text"],
+            "score": float(hit["distance"]),
+            "metadata": {
+                "source": entity["source"],
+                "file_type": entity.get("file_type", ""),
+                "page": page,
+                "start_index": int(
+                    entity.get("start_index", 0)
+                ),
+                "chunk_id": int(entity["chunk_id"]),
+            },
+        })
+
+    return results
 
 
 # 3. 测试检索

@@ -1,4 +1,4 @@
-
+from pathlib import Path
 import os
 from threading import Lock
 
@@ -7,8 +7,23 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 # 复用之前完成的模块
-from indexer import build_index
-from retriever import retrieve
+
+from indexer import (
+    build_index,
+    prepare_chunks,
+    load_embedding_model,
+)
+
+from retriever import retrieve, milvus_retrieve
+
+from milvus_store import (
+    COLLECTION_NAME,
+    connect_milvus,
+    make_id,
+    make_hash,
+    read_existing_hashes,
+)
+
 from hyde import hyde_embedding_texts
 from multi_query import (
     generate_queries,
@@ -94,46 +109,157 @@ def format_context(results: list[dict]) -> str:
 # 3. 定义 RAG 服务
 class RAGService:
 
+
     def __init__(self):
-        # 读取环境变量
         load_dotenv()
 
         api_key = os.getenv("DEEPSEEK_API_KEY")
 
         if not api_key:
-            raise ValueError("请先在 .env 中配置 DEEPSEEK_API_KEY")
+            raise ValueError(
+                "请先在 .env 配置 DEEPSEEK_API_KEY"
+            )
 
-        # 建立一次索引，并保存到对象中
-        self.chunks, self.vectors, self.embedding_model = (
-            build_index()
-        )
+        # 1. 选择检索后端
+        self.backend = os.getenv(
+            "RAG_BACKEND", "numpy"
+        ).strip().lower()
+
+        # 只有 Milvus 模式需要检查数据库同步状态
+        if self.backend == "milvus":
+
+            marker = (
+                Path(__file__).resolve().parent
+                / ".milvus_sync_incomplete"
+            )
+
+            if marker.exists():
+                raise RuntimeError(
+                    "检测到未完成的 Milvus 同步。"
+                    "请先运行 milvus_safe_ingest.py --apply "
+                    "并完成数据库验证。"
+                )
+
+        if self.backend not in {"numpy", "milvus"}:
+            raise ValueError(
+                "RAG_BACKEND 只能是 numpy 或 milvus"
+            )
+
+        self.milvus_client = None
+
+        try:
+            # 2. 初始化文档与向量后端
+            if self.backend == "milvus":
+
+                # 只加载文档和分块，不计算全部向量
+                self.chunks = prepare_chunks()
+                self.vectors = None
+
+                # 连接 Day 3 创建的数据库
+                self.milvus_client = connect_milvus()
+
+                if not self.milvus_client.has_collection(
+                    collection_name=COLLECTION_NAME
+                ):
+                    raise RuntimeError(
+                        "Milvus Collection 不存在，"
+                        "请先运行 python milvus_ingest.py"
+                    )
+
+                # 加载已经持久化的索引
+                self.milvus_client.load_collection(
+                    collection_name=COLLECTION_NAME,
+                    replica_number=1,
+                )
+
+                # 检查本地文档与数据库是否同步
+                expected = {
+                    make_id(chunk): make_hash(chunk)
+                    for chunk in self.chunks
+                }
+
+                actual = read_existing_hashes(
+                    self.milvus_client
+                )
+
+                if (
+                    len(expected) != len(self.chunks)
+                    or expected != actual
+                ):
+                    raise RuntimeError(
+                        "本地文档与 Milvus 数据不同步，"
+                        "请先运行 python milvus_ingest.py"
+                    )
+
+                # 只加载模型，供用户查询时生成 Embedding
+                self.embedding_model = load_embedding_model()
+
+            else:
+                # 3. 原有 NumPy 实现
+                (
+                    self.chunks,
+                    self.vectors,
+                    self.embedding_model,
+                ) = build_index()
+
+            # 4. BM25 仍使用原项目分块
+            self.bm25 = build_bm25_retriever(
+                chunks=self.chunks,
+                candidate_k=10,
+            )
+
+            # 5. 本地 BGE Reranker 延迟加载
+            self._reranker = None
+            self._reranker_lock = Lock()
+
+            # 6. DeepSeek 客户端，保留原配置
+            self.llm = ChatOpenAI(
+                model="deepseek-flash",
+                api_key=api_key,
+                base_url="https://api.deepseek.com",
+                use_responses_api=False,
+                extra_body={
+                    "thinking": {"type": "disabled"}
+                },
+                timeout=60,
+                max_retries=2,
+            )
+
+        except Exception:
+            # 初始化失败时释放已建立的连接
+            self.close()
+            raise
 
 
-        # 创建 BM25 检索器
-        self.bm25 = build_bm25_retriever(
+    def semantic_search(
+        self,
+        question: str,
+        top_k: int = 3,
+        embedding_texts: list[str] | None = None,
+    ) -> list[dict]:
+
+        if self.backend == "milvus":
+            return milvus_retrieve(
+                question=question,
+                model=self.embedding_model,
+                client=self.milvus_client,
+                top_k=top_k,
+                embedding_texts=embedding_texts,
+            )
+
+        return retrieve(
+            question=question,
             chunks=self.chunks,
-            candidate_k=10,
+            vectors=self.vectors,
+            model=self.embedding_model,
+            top_k=top_k,
+            embedding_texts=embedding_texts,
         )
-
-        # 本地 Reranker 暂时不加载
-        self._reranker = None
-
-        # 防止多个请求重复加载 Reranker
-        self._reranker_lock = Lock()
-
-
-        # 创建 DeepSeek 客户端
-        self.llm = ChatOpenAI(
-            model="deepseek-flash",
-            api_key=api_key,
-            base_url="https://api.deepseek.com",
-            use_responses_api=False,
-            extra_body={
-                "thinking": {"type": "disabled"}
-            },
-            timeout=60,
-            max_retries=2,
-        )
+    
+    def close(self):
+        if self.milvus_client is not None:
+            self.milvus_client.close()
+            self.milvus_client = None
 
     def _get_reranker(self):
 
@@ -178,9 +304,11 @@ class RAGService:
             raise ValueError("不支持的检索策略")
 
 
-        # 新策略 1：BM25
+
+        # 策略 1：BM25
         if strategy == "bm25":
 
+            # BM25 不需要向量数据库
             results = bm25_retrieve(
                 question=question,
                 chunks=self.chunks,
@@ -188,17 +316,15 @@ class RAGService:
                 top_k=top_k,
             )
 
-        # 新策略 2、3：Hybrid / Hybrid + Rerank
+        # 策略 2、3：Hybrid / Hybrid + Rerank
         elif strategy in {"hybrid", "hybrid_rerank"}:
 
-            # 如果要精排，就先保留更多候选
             fusion_top_k = (
                 max(8, top_k)
                 if strategy == "hybrid_rerank"
                 else top_k
             )
 
-            # 第一步：BM25 + Embedding + RRF
             results = hybrid_retrieve(
                 question=question,
                 chunks=self.chunks,
@@ -207,9 +333,12 @@ class RAGService:
                 bm25=self.bm25,
                 top_k=fusion_top_k,
                 candidate_k=10,
+
+                # 新增：统一向量检索接口
+                semantic_search=self.semantic_search,
             )
 
-            # 第二步：可选本地精排
+            # Hybrid + 本地 Rerank
             if strategy == "hybrid_rerank" and results:
 
                 try:
@@ -219,15 +348,16 @@ class RAGService:
                         reranker=self._get_reranker(),
                     )[:top_k]
 
-                except (OSError, RuntimeError, ImportError) as exc:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ImportError,
+                ) as exc:
                     raise RerankerUnavailableError(
                         "本地 Reranker 加载或推理失败"
                     ) from exc
 
-
-
-
-        # 第一种策略：Multi-Step
+        # 策略 4：Multi-Step
         elif strategy == "multi_step":
 
             results, _steps = multi_step_retrieve(
@@ -238,9 +368,12 @@ class RAGService:
                 model=self.embedding_model,
                 top_k=top_k,
                 max_steps=2,
+
+                # 新增
+                semantic_search=self.semantic_search,
             )
 
-        # 第二种策略：Multi-Query
+        # 策略 5：Multi-Query
         elif strategy == "multi_query":
 
             queries = generate_queries(
@@ -255,27 +388,31 @@ class RAGService:
                 vectors=self.vectors,
                 model=self.embedding_model,
                 top_k=top_k,
+
+                # 新增
+                semantic_search=self.semantic_search,
             )
 
-        # 第三、四种：Naive 和 HyDE
+        # 策略 6、7：Naive / HyDE
         else:
+
             embedding_texts = None
 
             if strategy == "hyde":
+
                 embedding_texts = hyde_embedding_texts(
                     llm=self.llm,
                     question=question,
                     include_original=include_original,
                 )
 
-            results = retrieve(
+            # 不再直接调用旧版 retrieve()
+            results = self.semantic_search(
                 question=question,
-                chunks=self.chunks,
-                vectors=self.vectors,
-                model=self.embedding_model,
                 top_k=top_k,
                 embedding_texts=embedding_texts,
             )
+
 
 
 

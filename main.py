@@ -1,3 +1,6 @@
+from pathlib import Path
+from milvus_store import COLLECTION_NAME
+from pymilvus import MilvusException
 from typing import Literal
 from contextlib import asynccontextmanager
 
@@ -71,24 +74,42 @@ class AskResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     chunks: int
+    backend: str
 
 
 # 5. 应用生命周期：启动时初始化 RAG
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     print("正在初始化 RAG 服务...")
 
-    # 只在本次服务启动时建立一次索引
-    app.state.rag = RAGService()
+    # 启动时只创建一次 RAGService
+    rag = RAGService()
 
-    print("RAG 初始化完成！")
-    print("文本块数量:", len(app.state.rag.chunks))
+    app.state.rag = rag
 
-    yield
+    try:
+        print(
+            "RAG 初始化完成，检索后端：",
+            rag.backend,
+        )
 
-    # 关闭服务时释放引用
-    del app.state.rag
-    print("RAG 服务已关闭")
+        print(
+            "文本块数量：",
+            len(rag.chunks),
+        )
+
+        # FastAPI 在这里开始处理 HTTP 请求
+        yield
+
+    finally:
+        # 应用关闭时释放 Milvus 客户端连接
+        rag.close()
+
+        del app.state.rag
+
+        print("RAG 服务已关闭")
+
 
 
 # 6. 创建 FastAPI 应用
@@ -103,20 +124,84 @@ app = FastAPI(
 # 7. 健康检查
 @app.get("/health", response_model=HealthResponse)
 def health(request: Request):
+
     rag = request.app.state.rag
 
     return {
         "status": "ok",
-        "chunks": len(rag.chunks)
+        "chunks": len(rag.chunks),
+        "backend": rag.backend,
     }
 
+
+# Milvus 同步状态标记
+SYNC_MARKER = (
+    Path(__file__).resolve().parent
+    / ".milvus_sync_incomplete"
+)
+
+
+@app.get("/ready")
+def readiness(request: Request):
+
+    rag = request.app.state.rag
+
+    # NumPy 模式不需要 Milvus
+    if rag.backend == "numpy":
+        return {
+            "status": "ready",
+            "backend": "numpy",
+        }
+
+    # 防止同步未完成时对外提供服务
+    if SYNC_MARKER.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="Milvus 知识库同步未完成",
+        )
+
+    try:
+        # 发送一个真实的数据库读取请求
+        rows = rag.milvus_client.query(
+            collection_name=COLLECTION_NAME,
+            filter="",
+            output_fields=["id"],
+            limit=1,
+            consistency_level="Strong",
+            timeout=3,
+        )
+
+        if not rows:
+            raise RuntimeError(
+                "Milvus Collection 没有可查询的数据"
+            )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Milvus 当前未就绪",
+        ) from exc
+
+    return {
+        "status": "ready",
+        "backend": "milvus",
+    }
 
 # 8. 文档问答接口
 @app.post("/ask", response_model=AskResponse)
 def ask(payload: AskRequest, request: Request):
     # 获取已经初始化的 RAG 对象
     rag = request.app.state.rag
-
+    
+    if (
+        rag.backend == "milvus"
+        and SYNC_MARKER.exists()
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="知识库正在同步或同步未完成",
+        )
+    
     try:
         # 调用 Day 4 的完整 RAG 流程
         result = rag.ask(
@@ -130,6 +215,15 @@ def ask(payload: AskRequest, request: Request):
         raise HTTPException(
             status_code=503,
             detail="本地精排模型不可用，请检查模型文件和运行环境",
+        ) from exc
+
+    except MilvusException as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Milvus 检索服务不可用，"
+                "请检查数据库状态"
+            ),
         ) from exc
 
     except APIError as exc:

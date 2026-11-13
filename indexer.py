@@ -44,41 +44,62 @@ def split_docs(
     return chunks
 
 
-# 2. 创建向量索引
-def build_index(
-    folder: Path = DATA_DIR,
-) -> tuple[list[Document], np.ndarray, SentenceTransformer]:
 
-    # 读取原始文档
+# 2. 只准备文档块，不计算 Embedding
+def prepare_chunks(
+    folder: Path = DATA_DIR,
+) -> list[Document]:
+
     docs = load_documents(folder)
 
     if not docs:
         raise ValueError("没有找到可以加载的文档")
 
-    # 文本分块
     chunks = split_docs(docs)
 
-    # 取出文本内容
-    texts = [chunk.page_content for chunk in chunks]
+    if not chunks:
+        raise ValueError("文档分块结果为空")
 
-    # 加载本地 Embedding 模型
-    model = SentenceTransformer(
+    return chunks
+
+
+# 3. 单独加载 Embedding 模型
+def load_embedding_model() -> SentenceTransformer:
+
+    return SentenceTransformer(
         MODEL_NAME,
-        device="cpu"
+        device="cpu",
     )
 
-    # 生成向量
+
+# 4. 保留原来的 build_index 接口
+def build_index(
+    folder: Path = DATA_DIR,
+) -> tuple[list[Document], np.ndarray, SentenceTransformer]:
+
+    # 复用新增的文档准备函数
+    chunks = prepare_chunks(folder)
+
+    texts = [
+        chunk.page_content
+        for chunk in chunks
+    ]
+
+    # 只有调用 build_index 时才加载模型
+    model = load_embedding_model()
+
     vectors = model.encode(
         texts,
         normalize_embeddings=True,
         convert_to_numpy=True,
-        show_progress_bar=False
+        show_progress_bar=False,
     )
 
     return chunks, vectors, model
 
 
-# 3. 测试索引构建
+
+# 测试索引构建
 if __name__ == "__main__":
     chunks, vectors, model = build_index()
 

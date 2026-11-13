@@ -62,6 +62,7 @@ def multi_step_retrieve(
     model,
     top_k: int = 3,
     max_steps: int = 2,
+    semantic_search=None,
 ) -> tuple[list[dict], list[dict]]:
 
     if not question.strip():
@@ -108,14 +109,21 @@ def multi_step_retrieve(
 
         seen_questions.add(sub_question)
 
-        # C. 使用原有 BGE 检索器
-        hits = retrieve(
-            question=sub_question,
-            chunks=chunks,
-            vectors=vectors,
-            model=model,
-            top_k=min(2, top_k),
-        )
+
+        if semantic_search is None:
+            hits = retrieve(
+                question=sub_question,
+                chunks=chunks,
+                vectors=vectors,
+                model=model,
+                top_k=min(2, top_k),
+            )
+        else:
+            hits = semantic_search(
+                question=sub_question,
+                top_k=min(2, top_k),
+            )
+
 
         if not hits:
             break

@@ -77,6 +77,7 @@ def multi_query_retrieve(
     vectors,
     model,
     top_k: int = 3,
+    semantic_search=None,
 ) -> list[dict]:
     """分别检索多个问题，并合并去重。"""
 
@@ -92,13 +93,21 @@ def multi_query_retrieve(
     # 第一步：每个问题分别检索
     for query in queries:
 
-        hits = retrieve(
-            question=query,
-            chunks=chunks,
-            vectors=vectors,
-            model=model,
-            top_k=top_k,
-        )
+
+        if semantic_search is None:
+            hits = retrieve(
+                question=query,
+                chunks=chunks,
+                vectors=vectors,
+                model=model,
+                top_k=top_k,
+            )
+        else:
+            hits = semantic_search(
+                question=query,
+                top_k=top_k,
+            )
+
 
         # 第二步：逐条处理检索结果
         for hit in hits:

@@ -12,3 +12,4 @@ llama-index-core==0.14.25
 llama-index-llms-langchain==0.9.0
 langchain-classic==1.0.8
 langchain-community==0.4.1
+pymilvus==3.0.2
